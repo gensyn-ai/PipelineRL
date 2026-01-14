@@ -373,13 +373,19 @@ def run_preprocessing_loop(
         wait_for_inference_servers(llm_urls)
 
     input_stream = SingleStreamSpec(exp_path=exp_root_dir, topic=cfg.preprocess.input)
+    
+    # We want to broadcast data to all trainer groups.
+    # Each group has `finetune_gpus_per_replica` workers, numbered 0..N-1 within the group.
+    # They will read from partitions 0..N-1.
+    # So we write to partitions 0..N-1.
+    num_partitions = max(world_map.finetune_gpus_per_replica, 1)
     output_stream = StreamRangeSpec(
         exp_path=exp_root_dir,
         topic=cfg.preprocess.output,
-        partition_range=(0, max(world_map.total_finetune_gpus, 1)),
+        partition_range=(0, num_partitions),
     )
     stats_streams = SingleStreamSpec(exp_path=exp_root_dir, topic="preprocessor_stats")
-    logger.info("Streams initialized")
+    logger.info(f"Streams initialized (writing to {num_partitions} partitions)")
 
     raw_chunk_queue = Queue(cfg.preprocess.raw_queue_size)
     rl_config = RLConfig(**cfg.finetune.rl)
@@ -438,8 +444,10 @@ def run_preprocessing_loop(
     buffer = deque()
     
     # Sequence packing configuration
-    num_trainers = world_map.total_finetune_gpus
-    num_lead_trainers = world_map.total_finetune_gpus // cfg.finetune.seq_parallel
+    # We pretend there is only one group of trainers from the preprocessor's perspective,
+    # because we write to partitions 0..N-1 and all groups read from 0..N-1 (broadcast).
+    num_trainers = max(world_map.finetune_gpus_per_replica, 1)
+    num_lead_trainers = num_trainers // cfg.finetune.seq_parallel
     gradient_accumulation_passes_per_lead = cfg.finetune.gradient_accumulation_passes // num_lead_trainers
     samples_per_lead_per_step = cfg.finetune.train_batch_size * gradient_accumulation_passes_per_lead
     train_batch_size = samples_per_lead_per_step * num_lead_trainers

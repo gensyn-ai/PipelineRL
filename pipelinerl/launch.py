@@ -459,9 +459,15 @@ def clean_up(exp_dir, force_restart):
         os.remove(f"{exp_dir}/dump.rdb")
 
     if force_restart:
+        # Clean up legacy finetune directory
         if os.path.exists(f"{exp_dir}/finetune"):
             logger.info("Cleaning up finetune directory")
             shutil.rmtree(f"{exp_dir}/finetune")
+        # Clean up per-group finetune directories (finetune_0, finetune_1, etc.)
+        for finetune_dir in exp_dir.glob("finetune_*"):
+            if finetune_dir.is_dir():
+                logger.info(f"Cleaning up {finetune_dir}")
+                shutil.rmtree(finetune_dir)
 
         # erase all the logs
         log_files = list(exp_dir.glob("**/*.log"))
@@ -579,7 +585,7 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
                 continue            
             processes.extend(run_ref_llm(cfg, job.replica_idx, job.local_idx, job.gpus, exp_dir))
         elif job.kind == "finetune":
-            processes.extend(run_finetune(cfg, world_map, job.gpus, exp_dir))
+            processes.extend(run_finetune(cfg, world_map, job, exp_dir))
         else:
             raise ValueError(f"Unknown job kind {job.kind}")
     return processes

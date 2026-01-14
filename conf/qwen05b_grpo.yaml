@@ -1,0 +1,39 @@
+defaults:
+  - base
+  - override finetune: grpo
+  - _self_
+
+# Qwen 0.5B model for multi-trainer GRPO experiment
+model_path: Qwen/Qwen2.5-0.5B
+
+# Multi-trainer configuration: 2 isolated trainer groups
+# Each group has its own actor(s) and trainer(s)
+# Weight updates: Trainer N -> Actor N (isolated per group)
+# Rollouts: All Actors -> Shared Stream -> All Trainers (broadcast)
+#
+# With 4 GPUs and 2 replicas:
+#   - 2 GPUs for actors (1 per group)
+#   - 2 GPUs for finetune (1 per group)
+world:
+  replicas: 2
+  actor_fraction: 2
+  finetune_fraction: 2
+  preprocessor_fraction: 0
+
+finetune:
+  seq_length: 8192
+  max_train_steps: 1000
+  train_batch_size: 1
+  gradient_accumulation_passes: 64
+  learning_rate: 1e-5
+
+vllm_config:
+  vllm_kwargs:
+    max_model_len: 8192
+    tensor-parallel-size: 1
+    pipeline-parallel-size: 1
+
+llm:
+  parameters:
+    max_tokens: 4096
+    temperature: 1.0

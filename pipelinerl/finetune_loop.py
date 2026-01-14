@@ -334,7 +334,8 @@ def run_finetuning_loop(
 
     # Rendez-vous with inference servers
     #TODO: rename the stream to be more general
-    weight_update_stream = SingleStreamSpec(exp_path=exp_root_dir, topic="weight_update_request")
+    trainer_group = cfg.me.get("trainer_group", 0)
+    weight_update_stream = SingleStreamSpec(exp_path=exp_root_dir, topic=f"{TRAINER_TOPIC}_{trainer_group}")
 
     # Logging
     if get_accelerator().is_main_process:
@@ -410,7 +411,7 @@ def run_finetuning_loop(
     if get_accelerator().is_main_process and args.send_weight_updates:
         logger.info("Initializing actor process group")
         actor_update_group = pipelinerl.torch_utils.init_extra_process_group(
-            group_name="actor",
+            group_name=f"actor_{trainer_group}",
             backend="nccl",
             init_method=cfg.me.weight_update_group_init_method,
             rank=0,

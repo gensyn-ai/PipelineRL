@@ -5,11 +5,9 @@ import sys
 from pathlib import Path
 
 import torch
-from peft.mapping import get_peft_model
-from peft.peft_model import PeftModel
-from peft.tuners.lora import LoraConfig
-from peft.utils.other import prepare_model_for_kbit_training
-from peft.utils.save_and_load import set_peft_model_state_dict
+from peft import get_peft_model, PeftModel, LoraConfig, prepare_model_for_kbit_training, set_peft_model_state_dict
+# from peft.utils.other import prepare_model_for_kbit_training
+# from peft.utils.save_and_load import set_peft_model_state_dict
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
