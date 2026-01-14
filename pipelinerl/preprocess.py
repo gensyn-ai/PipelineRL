@@ -374,10 +374,6 @@ def run_preprocessing_loop(
 
     input_stream = SingleStreamSpec(exp_path=exp_root_dir, topic=cfg.preprocess.input)
     
-    # We want to broadcast data to all trainer groups.
-    # Each group has `finetune_gpus_per_replica` workers, numbered 0..N-1 within the group.
-    # They will read from partitions 0..N-1.
-    # So we write to partitions 0..N-1.
     num_partitions = max(world_map.finetune_gpus_per_replica * max(cfg.world.replicas, 1), 1)
     output_stream = StreamRangeSpec(
         exp_path=exp_root_dir,
@@ -450,8 +446,6 @@ def run_preprocessing_loop(
     buffer = deque()
     
     # Sequence packing configuration
-    # We pretend there is only one group of trainers from the preprocessor's perspective,
-    # because we write to partitions 0..N-1 and all groups read from 0..N-1 (broadcast).
     num_trainers_per_group = max(world_map.finetune_gpus_per_replica, 1)
     num_trainers = max(num_trainers_per_group * max(cfg.world.replicas, 1), 1)
     num_lead_trainers_per_group = num_trainers_per_group // cfg.finetune.seq_parallel
