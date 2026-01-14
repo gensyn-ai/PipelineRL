@@ -89,6 +89,19 @@ async def llm_async_generate(
     logger.debug(f"POST request to {llm.base_url}/v1/chat/completions")
 
     payload = _to_plain_obj({**data, **extra_parameters})
+
+    try:
+        prompt_tokens = llm.count_tokens(prompt.messages)
+        context_size = int(getattr(llm, "context_size", 0) or 0)
+        if context_size > 0:
+            remaining = max(context_size - prompt_tokens, 0)
+            for token_key in ("max_tokens", "max_completion_tokens"):
+                if token_key in payload and payload[token_key] is not None:
+                    requested = int(payload[token_key])
+                    payload[token_key] = min(requested, remaining)
+    except Exception:
+        pass
+
     async with session.post(
         url=f"{llm.base_url}/v1/chat/completions",
         json=payload,

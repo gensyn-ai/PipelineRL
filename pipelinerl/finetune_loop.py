@@ -359,7 +359,7 @@ def run_finetuning_loop(
         exp_path=exp_root_dir,
         topic=args.input,
         instance=0,
-        partition=get_accelerator().process_index,
+        partition=int(cfg.me.get("trainer_group", 0)) * int(num_processes) + int(get_accelerator().process_index),
     )
 
     logger.info(f"Using {'packed' if args.seq_packing else 'unpacked'} collate function")
@@ -411,7 +411,7 @@ def run_finetuning_loop(
     if get_accelerator().is_main_process and args.send_weight_updates:
         logger.info("Initializing actor process group")
         actor_update_group = pipelinerl.torch_utils.init_extra_process_group(
-            group_name=f"actor_{trainer_group}",
+            group_name="actor",
             backend="nccl",
             init_method=cfg.me.weight_update_group_init_method,
             rank=0,

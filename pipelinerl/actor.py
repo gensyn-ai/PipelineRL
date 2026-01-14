@@ -335,8 +335,11 @@ class ActorLoop:
             assert llm_group
             llm_idxs = [llm[0] for llm in llm_group]
             llms = [llm[1] for llm in llm_group]
+            replica_idx = int(self.cfg.me.get("replica_idx", 0))
+            trainer_group = int(self.cfg.me.get("trainer_group", 0))
             scheduler_name = (
-                f"{'train' if is_training else 'test'} scheduler for llms {','.join([str(i) for i in llm_idxs])}"
+                f"{'train' if is_training else 'test'} scheduler actor_{replica_idx} group_{trainer_group} "
+                f"llms {','.join([str(i) for i in llm_idxs])}"
             )
             process = mp.Process(
                 target=rollout_maker_entrypoint,

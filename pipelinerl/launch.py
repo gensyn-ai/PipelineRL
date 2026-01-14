@@ -170,16 +170,23 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
 
 
 def run_actor_llm(
-    cfg: DictConfig, world_map: WorldMap, actor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path
+    cfg: DictConfig, world_map: WorldMap, job: Job, exp_dir: Path
 ):
-    finetune_model_path = exp_dir / "finetune" / "current"
+    actor_llm_idx = job.replica_idx
+    local_idx = job.local_idx
+    gpus = job.gpus
+    trainer_group = job.trainer_group
+    os.makedirs(exp_dir / "stores", exist_ok=True)
+    
+    # Each trainer group has its own finetune output directory
+    finetune_model_path = exp_dir / f"finetune_{trainer_group}" / "current"
     if os.path.exists(finetune_model_path):
         actor_model_path = finetune_model_path
     else:
         actor_model_path = cfg.model_path
 
     # TODO: add support for tensor and process parallelism
-    log_dir = exp_dir / f"actor_vllm_{actor_llm_idx}"
+    log_dir = exp_dir / f"actor_vllm_{trainer_group}_{actor_llm_idx}"
     os.makedirs(log_dir, exist_ok=True)
     entrypoint = (
         "pipelinerl.entrypoints.run_vllm1" 
@@ -201,7 +208,7 @@ def run_actor_llm(
         "--actor-llm-idx",
         str(actor_llm_idx),
         "--weight-update-group-init-method",
-        f"tcp://{world_map.master_addr}:{cfg.world.actor_group_port}",
+        f"file://{(exp_dir / 'stores' / f'weight_update_group_{trainer_group}.store').resolve()}",
         "--weight-update-group-world-size",
         str(world_map.weight_update_group_size),
     ]
@@ -235,10 +242,10 @@ def run_actor_llm(
         yield LaunchedProcess(kind="actor_llm", handle=proc)
 
 
-def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
-    if actor_idx != 0:
-        raise NotImplementedError("Can only do 1 actor yet")
-    llm_urls = "+".join(world_map.get_actor_urls())
+def run_actor(world_map: WorldMap, job: Job, exp_dir: Path):
+    trainer_group = job.trainer_group
+    llm_urls = "+".join(world_map.get_actor_urls(trainer_group))
+    actor_dir = exp_dir / f"actor_{trainer_group}"
     cmd = [
         "python",
         "-m",
@@ -248,11 +255,13 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
         "--config-name",
         "exp_config",
         f"output_dir={exp_dir}",
-        f"hydra.run.dir={exp_dir}/actor",
+        f"hydra.run.dir={actor_dir}",
         f"+me.llm_urls={llm_urls}",
+        f"+me.replica_idx={job.replica_idx}",
+        f"+me.trainer_group={trainer_group}",
     ]
-    logger.info(f"Running actor with command: {' '.join(cmd)}")
-    save_command(exp_dir / "actor", cmd)
+    logger.info(f"Running actor (group {trainer_group}) with command: {' '.join(cmd)}")
+    save_command(actor_dir, cmd)
     proc = _popen(
         cmd,
         env=dict(os.environ),
@@ -292,9 +301,14 @@ def run_environment(cfg: DictConfig, job: Job):
         yield LaunchedProcess(kind="environment", handle=proc)
 
 
-def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
+def run_finetune(cfg: DictConfig, world_map: WorldMap, job: Job, exp_dir: Path):
     if cfg.use_fsdp and cfg.use_deepspeed:
         raise ValueError("Cannot use both FSDP and DeepSpeed")
+    gpus = job.gpus
+    trainer_group = job.trainer_group
+    finetune_output_dir = exp_dir / f"finetune_{trainer_group}"
+    os.makedirs(exp_dir / "stores", exist_ok=True)
+    master_port = int(os.environ.get("MASTER_PORT", 29500)) + trainer_group
     cmd = [
         "python",
         "-m",
@@ -307,22 +321,24 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         hosts = [world_map.master_addr[:-2] + f"-{i}" for i in range(world_map.world_size)]
         filter_parts = []
         for rank, job_list in world_map.job_map.items():
-            for job in job_list:
-                if job.kind == "finetune":
-                    filter_parts.append(f"{hosts[rank]}:{','.join(map(str, job.gpus))}")
+            for j in job_list:
+                if j.kind == "finetune" and j.trainer_group == trainer_group:
+                    filter_parts.append(f"{hosts[rank]}:{','.join(map(str, j.gpus))}")
         deepspeed_include_filter = "@".join(filter_parts)
-        logger.info(f"Deepspeed include filter: {deepspeed_include_filter}")
+        logger.info(f"Deepspeed include filter (group {trainer_group}): {deepspeed_include_filter}")
         # Orchestrator rank must have already created hostfile.txt
         hostfile_path = str(exp_dir / "hostfile.txt")
+        nodes_in_group = world_map.nodes_with_finetuning_for_group(trainer_group)
+        machine_rank = world_map.my_finetuning_rank_for_group(trainer_group)
         cmd += [
             "--num_machines",
-            str(len(world_map.nodes_with_finetuning())),
+            str(len(nodes_in_group)),
             "--machine_rank",
-            str(world_map.my_finetuning_rank()),
+            str(machine_rank),
             "--main_process_ip",
             str(os.environ.get("MASTER_ADDR")),
             "--main_process_port",
-            str(os.environ.get("MASTER_PORT")),
+            str(master_port),
             "--deepspeed_hostfile",
             hostfile_path,
             "--deepspeed_inclusion_filter",
@@ -352,7 +368,11 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         "--config_file",
         str(this_file_path / f"../conf/accelerate/{accelerate_config}.yaml"),
         "--rdzv_backend",
-        "c10d",
+        "static",
+        "--main_process_ip",
+        str(world_map.master_addr),
+        "--main_process_port",
+        str(master_port),
     ]
     if gpus:
         gpus_str = str(",".join([str(gpu) for gpu in gpus])) if len(gpus) < world_map.node_size else "all"
@@ -362,27 +382,30 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         ]
     cmd += [
         "--num_processes",
-        str(world_map.total_finetune_gpus),
+        str(world_map.finetune_gpus_per_replica),
         "pipelinerl/entrypoints/run_finetune.py",
         "--config-dir",
         f"{exp_dir}/conf",
         "--config-name",
         "exp_config",
         f"output_dir={exp_dir}",
-        f"hydra.run.dir={exp_dir}/finetune",
+        f"hydra.run.dir={finetune_output_dir}",
+        f"finetune.output_dir={finetune_output_dir}",
+        f"+me.trainer_group={trainer_group}",
         # TODO: figure out why we can't build WorldMap in run_finetune.py
         # Current workaround: pass the essential information as follows:
-        f"+me.weight_update_group_init_method=tcp://{world_map.master_addr}:{cfg.world.actor_group_port}",
+        f"+me.weight_update_group_init_method=file://{(exp_dir / 'stores' / f'weight_update_group_{trainer_group}.store').resolve()}",
         f"+me.weight_update_group_world_size={world_map.weight_update_group_size}",
-        f"+me.llm_urls={'+'.join(world_map.get_actor_urls())}",
+        f"+me.llm_urls={'+'.join(world_map.get_actor_urls(trainer_group))}",
     ]
     if cfg.debug.mode in ["finetune", "open_loop", "finetune+preprocessor"]:
         cmd.append("finetune.send_weight_updates=False")
 
-    logger.info(f"Running finetune with command: {' '.join(cmd)}")
-    save_command(exp_dir / "finetune", cmd)
+    logger.info(f"Running finetune (group {trainer_group}) with command: {' '.join(cmd)}")
+    save_command(finetune_output_dir, cmd)
     env = dict(os.environ)
     env["DS_ENV_FILE"] = str(exp_dir / ".deepspeed_env")
+    env["MASTER_PORT"] = str(master_port)
     proc = _popen(cmd, env=env)
     if proc is not None:
         yield LaunchedProcess(kind="finetune", handle=proc)
@@ -482,11 +505,7 @@ def is_inference_process(proc: LaunchedProcess) -> bool:
 
 
 def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], debug_mode: bool = False):
-    if not debug_mode:
-        trainer_state = TrainerState(exp_path)
-        trainer_state.start_listening()
-    else:
-        trainer_state = None
+    trainer_state = None
 
     # Wait for all processes to complete
     def gently_stop_all_processes():
@@ -518,13 +537,8 @@ def watch_processes_running(exp_path: Path, processes: List[LaunchedProcess], de
                 logger.info(f"Process {proc.handle.args} finished cleanly")
                 alive.remove(proc)
             if alive and all(is_inference_process(proc) for proc in alive):
-                # shut down inference servers after training is complete
-                if trainer_state is not None and not trainer_state.training_done:
-                    # check if training is completed
-                    logger.info(f"Waiting for training completion signal (training_done={trainer_state.training_done})")
-                    trainer_state.wait_for_training_done(timeout=5.0)
-                    continue
-                logger.info(f"Trainer completion detected; stopping remaining {len(alive)} inference server(s)")
+                # shut down inference servers after all finetune processes have exited
+                logger.info(f"Training completion detected; stopping remaining {len(alive)} inference server(s)")
                 for proc in list(alive):
                     logger.info(f"Terminating inference server {proc.handle.args}")
                     terminate_with_children(proc.handle.pid)
@@ -571,13 +585,13 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
         if job.kind not in job_kind_filter:
             continue
         if job.kind == "actor":
-            processes.extend(run_actor(world_map, job.replica_idx, exp_dir))
+            processes.extend(run_actor(world_map, job, exp_dir))
         elif job.kind == "environment":
             processes.extend(run_environment(cfg, job))
         elif job.kind == "actor_llm":
             if cfg.debug.use_existing_llms:
                 continue
-            processes.extend(run_actor_llm(cfg, world_map, job.replica_idx, job.local_idx, job.gpus, exp_dir))
+            processes.extend(run_actor_llm(cfg, world_map, job, exp_dir))
         elif job.kind == "preprocessor":
             processes.extend(run_preprocess(world_map, job.replica_idx, exp_dir))
         elif job.kind == "preprocessor_llm":
@@ -644,6 +658,7 @@ def main(cfg: DictConfig):
     if world_map.my_rank == 0:
         clean_up(exp_dir, cfg.force_restart)
         os.makedirs(config_dir, exist_ok=True)
+        os.makedirs(exp_dir / "stores", exist_ok=True)
         OmegaConf.save(cfg, config_dir / "exp_config.yaml")
         logger.info("Orchestrator 0 created the exp folder")
         if cfg.streams.backend == "redis":

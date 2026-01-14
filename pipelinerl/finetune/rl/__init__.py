@@ -423,6 +423,8 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
     df_init = pd.DataFrame(dataset)
     assert isinstance(df_init, pd.DataFrame)
 
+    df_init["_row_id"] = np.arange(len(df_init), dtype=np.int64)
+
     # Step 1: calculate group-level statistics
     df_stats = df_init[["group_id", "rollout_index", "step_index"]].copy()
     df_stats["num_tokens"] = df_init["input_ids"].apply(len)
@@ -452,10 +454,11 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
 
     # Step 2: calculate advantages for each sample
     df_advantages = pd.merge(
-        df_init[["group_id", "rollout_index", "step_index", "rewards"]],
+        df_init[["_row_id", "group_id", "rollout_index", "step_index", "rewards"]],
         df_grouped,
         on="group_id",
-        how="left"
+        how="left",
+        sort=False,
     )
     assert len(df_advantages) == len(df_init)
     def calculate_advantages(row):
@@ -477,6 +480,7 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
         columns=["rewards", "rollout_reward_sum", "rollout_reward_count", "rollout_reward_std"]
     )
     assert df_advantages.columns.tolist() == [
+        "_row_id",
         "group_id",
         "rollout_index",
         "step_index",
@@ -486,9 +490,9 @@ def populate_rl_data(dataset: list[dict[str, Any]], eos_token_id: int, config: R
 
     # Step 3: bring advantages and group level stats back to the main df
     df = df_init.drop(columns=["advantages", "group_tokens"])
-    df = pd.merge(df, df_advantages, on=["group_id", "rollout_index", "step_index"], how="left")
-    # Debug print lengths of all dataframes
+    df = pd.merge(df, df_advantages, on=["_row_id"], how="left", sort=False, validate="one_to_one")
     assert len(df) == len(df_init)
+    df = df.drop(columns=["_row_id"])
 
     # Step 4: make token-level overflow and mean group length information
     def _overflow_from_finish_reason(row):

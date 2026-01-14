@@ -26,6 +26,7 @@ class Job(BaseModel):
     gpus: list[int] = []
     # The URL of the job
     url: str = ""
+    trainer_group: int = 0
 
 
 class WorldMap:
@@ -74,17 +75,38 @@ class WorldMap:
         if cfg.environment:
             self._place_environments(cfg)
 
-        # Place the finetune workers on the remaining gpus, take all remaining GPUs
+        # Place the finetune workers on the remaining gpus, split by trainer group
+        # Collect all remaining GPUs first
+        all_remaining_gpus = []
+        for node, remaining_gpus in self.available_gpus.items():
+            for gpu in remaining_gpus:
+                all_remaining_gpus.append((node, gpu))
+        
+        assert len(all_remaining_gpus) == self.total_finetune_gpus
+        
+        # Split GPUs among trainer groups (replicas)
         current_finetune_rank = 0
         finetune_rank_node = {}
-        for node, remaining_gpus in self.available_gpus.items():
-            gpus = list(remaining_gpus)
-            if gpus:
-                self.add_job(node_rank=node, kind="finetune", replica_idx=node, gpus=gpus)
-                for _ in remaining_gpus:
-                    finetune_rank_node[current_finetune_rank] = node
-                    current_finetune_rank += 1
-
+        if cfg.world.replicas > 0 and self.finetune_gpus_per_replica > 0:
+            for group_idx in range(cfg.world.replicas):
+                start_idx = group_idx * self.finetune_gpus_per_replica
+                end_idx = start_idx + self.finetune_gpus_per_replica
+                group_gpus = all_remaining_gpus[start_idx:end_idx]
+                
+                # Group GPUs by node for this trainer group
+                gpus_by_node = {}
+                for node, gpu in group_gpus:
+                    if node not in gpus_by_node:
+                        gpus_by_node[node] = []
+                    gpus_by_node[node].append(gpu)
+                
+                # Create finetune job(s) for this trainer group
+                for node, gpus in gpus_by_node.items():
+                    self.add_job(node_rank=node, kind="finetune", replica_idx=group_idx, gpus=gpus, trainer_group=group_idx)
+                    for _ in gpus:
+                        finetune_rank_node[current_finetune_rank] = node
+                        current_finetune_rank += 1
+        
         assert current_finetune_rank == self.total_finetune_gpus
         if self.total_finetune_gpus % cfg.finetune.seq_parallel != 0:
             raise ValueError(
@@ -106,7 +128,9 @@ class WorldMap:
         for node, jobs in self.job_map.items():
             self._log_info(f"Node {node} has {len(jobs)} jobs:")
             for job in jobs:
-                self._log_info(f"  {job.kind} {job.replica_idx} on gpus {job.gpus}, local idx {job.local_idx}")
+                self._log_info(
+                    f"  {job.kind} {job.replica_idx} (trainer_group={job.trainer_group}) on gpus {job.gpus}, local idx {job.local_idx}"
+                )
 
     def add_job(self, node_rank: int, kind: str, replica_idx: int, local_idx: int = 0, port: int | None = None, gpus: list[int] | None = None, cpu_heavy: bool = False, url: str = "", trainer_group: int = 0) -> Job:
         """Add a job to the world map."""
@@ -194,7 +218,9 @@ class WorldMap:
         for worker_idx in range(cfg.world.replicas):
             node = self.get_least_busy_node()
             self.add_job(kind="actor", replica_idx=worker_idx, trainer_group=worker_idx, node_rank=node, gpus=[], cpu_heavy=True)
-            self.add_job(kind="preprocessor", replica_idx=worker_idx, trainer_group=worker_idx, node_rank=node, gpus=[], cpu_heavy=True)
+        if cfg.world.replicas > 0:
+            node = self.get_least_busy_node()
+            self.add_job(kind="preprocessor", replica_idx=0, trainer_group=0, node_rank=node, gpus=[], cpu_heavy=True)
 
     def _place_environments(self, cfg):
         for worker_idx in range(cfg.world.env_replicas):

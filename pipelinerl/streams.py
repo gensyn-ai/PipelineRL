@@ -256,11 +256,17 @@ class FileStreamWriter(StreamWriter):
         _file_dir = stream_dir(self.stream.exp_path, self.stream.topic, self.stream.instance, self.stream.partition)
         os.makedirs(_file_dir, exist_ok=True)
         self._file_path = stream_file(_file_dir, 0)
-        self._file = open(self._file_path, self.mode)
+        if self.mode == "a":
+            flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY
+        elif self.mode == "w":
+            flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY
+        else:
+            raise ValueError(f"Invalid mode: {self.mode}")
+        self._fd = os.open(self._file_path, flags)
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self._file.close()
+        os.close(self._fd)
 
     def write(self, data, partition: int | None = None):
         if partition is not None:
@@ -272,9 +278,8 @@ class FileStreamWriter(StreamWriter):
                 if isinstance(value, torch.Tensor):
                     data_dict[key] = value.numpy()
             data = data_dict
-        self._file.write(orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY).decode("utf-8"))
-        self._file.write("\n")
-        self._file.flush()
+        payload = orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY) + b"\n"
+        os.write(self._fd, payload)
 
 
 def read_jsonl_stream(f: TextIO, retry_delay: float = _REREAD_DELAY) -> Iterator[Any]:
@@ -327,9 +332,20 @@ class FileStreamReader(StreamReader):
                     yield line
                     cur_retries = 0
             except json.JSONDecodeError as e:
+                if "Extra data" in str(e):
+                    logger.error(
+                        f"Corrupted JSON line in stream {self.stream} at position {e.position}; skipping one line"
+                    )
+                    self._file.close()
+                    self._file = open(self._file_path, "r")
+                    self._file.seek(e.position)
+                    self._file.readline()
+                    retry_time = 0.01
+                    cur_retries = 0
+                    continue
+
                 # Sometimes when the stream file is being written to as the as time as we reading it,
-                # we get lines like \0x00\0x00\0x00\0x00\0x00\0x00\0x00\0x00 that break the JSON decoder.
-                # We have to reopen the file and seek to the previous position to try again.
+                # we get invalid lines. Reopen and retry from the previous position.
                 if cur_retries < max_retries:
                     logger.warning(
                         f"Could not decode JSON from {self.stream}, might have run into end of the file. Will reopen the file and retry ({cur_retries}/{max_retries}), starting from position {e.position})"
@@ -342,8 +358,16 @@ class FileStreamReader(StreamReader):
                     cur_retries += 1
                     continue
                 else:
-                    logger.error(f"Error reading stream {self.stream}, giving up after {max_retries} retries")
-                    raise e
+                    logger.error(
+                        f"Error reading stream {self.stream}, giving up after {max_retries} retries; skipping one line"
+                    )
+                    self._file.close()
+                    self._file = open(self._file_path, "r")
+                    self._file.seek(e.position)
+                    self._file.readline()
+                    retry_time = 0.01
+                    cur_retries = 0
+                    continue
 
 
 class RoundRobinFileStreamWriter(StreamWriter):
