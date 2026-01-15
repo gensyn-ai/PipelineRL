@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 
 
 class TrainerState:
-    def __init__(self, exp_path: Path):
+    def __init__(self, exp_path: Path, trainer_group: int = 0):
         self.exp_path = exp_path
+        self.trainer_group = trainer_group
         self.propagated_weight_version: int | None = None
         self.samples_processed: int | None = None
         self.training_done: bool = False
@@ -32,7 +33,12 @@ class TrainerState:
         self._training_done_event.set()
 
     def start_listening(self):
-        stream = SingleStreamSpec(exp_path=self.exp_path, topic=TRAINER_TOPIC)
+        topic = TRAINER_TOPIC
+        if self.trainer_group > 0:
+            topic = f"{topic}_{self.trainer_group}"
+        
+        topic = f"{TRAINER_TOPIC}_{self.trainer_group}"
+        stream = SingleStreamSpec(exp_path=self.exp_path, topic=topic)
 
         def listen():
             with read_stream(stream) as reader:

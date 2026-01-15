@@ -373,13 +373,15 @@ def run_preprocessing_loop(
         wait_for_inference_servers(llm_urls)
 
     input_stream = SingleStreamSpec(exp_path=exp_root_dir, topic=cfg.preprocess.input)
+    
+    num_partitions = max(world_map.finetune_gpus_per_replica * max(cfg.world.replicas, 1), 1)
     output_stream = StreamRangeSpec(
         exp_path=exp_root_dir,
         topic=cfg.preprocess.output,
-        partition_range=(0, max(world_map.total_finetune_gpus, 1)),
+        partition_range=(0, num_partitions),
     )
     stats_streams = SingleStreamSpec(exp_path=exp_root_dir, topic="preprocessor_stats")
-    logger.info("Streams initialized")
+    logger.info(f"Streams initialized (writing to {num_partitions} partitions)")
 
     raw_chunk_queue = Queue(cfg.preprocess.raw_queue_size)
     rl_config = RLConfig(**cfg.finetune.rl)
@@ -396,19 +398,25 @@ def run_preprocessing_loop(
     dataset_loader_thread = threading.Thread(target=dataset_loader_worker_fn, daemon=True)
     dataset_loader_thread.start()
     
-    # Initialize TrainerState
-    trainer_state = TrainerState(exp_root_dir)
+    # Initialize TrainerState(s)
+    # In multi-trainer mode, we want to coordinate against all trainer groups.
+    trainer_states = [TrainerState(exp_root_dir, trainer_group=i) for i in range(cfg.world.replicas)]
     if cfg.debug.mode == "preprocessor":
         logger.info("Debug mode: preprocessor")
-        trainer_state.debug_mode_init()
+        for ts in trainer_states:
+            ts.debug_mode_init()
     elif cfg.debug.mode == "finetune+preprocessor":
         logger.info("Debug mode: finetune+preprocessor")
-        trainer_state.start_listening()
-        trainer_state.wait_for_processed_samples()
+        for ts in trainer_states:
+            ts.start_listening()
+        for ts in trainer_states:
+            ts.wait_for_processed_samples()
     else:
-        logger.info("Normal mode, waiting for finetune loop to start")
-        trainer_state.start_listening()
-        trainer_state.wait_for_model_version()
+        logger.info("Normal mode, waiting for finetune loop(s) to start")
+        for ts in trainer_states:
+            ts.start_listening()
+        for ts in trainer_states:
+            ts.wait_for_model_version()
     final_train_steps = calculate_train_steps(cfg.finetune, cfg.finetune.interrupt_train_steps)
     samples_target = final_train_steps * cfg.finetune.train_batch_size * cfg.finetune.gradient_accumulation_passes
 
@@ -438,13 +446,17 @@ def run_preprocessing_loop(
     buffer = deque()
     
     # Sequence packing configuration
-    num_trainers = world_map.total_finetune_gpus
-    num_lead_trainers = world_map.total_finetune_gpus // cfg.finetune.seq_parallel
-    gradient_accumulation_passes_per_lead = cfg.finetune.gradient_accumulation_passes // num_lead_trainers
+    num_trainers_per_group = max(world_map.finetune_gpus_per_replica, 1)
+    num_trainers = max(num_trainers_per_group * max(cfg.world.replicas, 1), 1)
+    num_lead_trainers_per_group = num_trainers_per_group // cfg.finetune.seq_parallel
+    num_lead_trainers = max(num_lead_trainers_per_group * max(cfg.world.replicas, 1), 1)
+    gradient_accumulation_passes_per_lead = cfg.finetune.gradient_accumulation_passes // num_lead_trainers_per_group
     samples_per_lead_per_step = cfg.finetune.train_batch_size * gradient_accumulation_passes_per_lead
     train_batch_size = samples_per_lead_per_step * num_lead_trainers
     processed_entries_queue = deque(maxlen=cfg.preprocess.ring_buffer_size)
-    published_samples = trainer_state.wait_for_processed_samples()
+    # All trainer groups should publish their initial processed samples count.
+    min_samples_processed_init = min(ts.wait_for_processed_samples() for ts in trainer_states)
+    published_samples = min_samples_processed_init * max(cfg.world.replicas, 1)
     last_published_samples = published_samples
     assert published_samples % num_lead_trainers == 0
     samples_per_trainer = {
@@ -496,11 +508,12 @@ def run_preprocessing_loop(
                 writing_took = 0
                 num_filtered_out = 0
                 while True:
-                    if (
-                        trainer_state.samples_processed is not None
-                        and trainer_state.samples_processed >= samples_target
+                    # Stop only when all trainer groups have reached the target.
+                    if all(
+                        ts.samples_processed is not None and ts.samples_processed >= samples_target
+                        for ts in trainer_states
                     ):
-                        logger.info("Trainer signalled completion; stopping preprocessor loop")
+                        logger.info("All trainer groups signalled completion; stopping preprocessor loop")
                         break
                     llm = llms[next_llm_index] if llms else None
                     if not input_queue.full():
@@ -564,8 +577,11 @@ def run_preprocessing_loop(
                     
                     max_unconsumed_samples = cfg.preprocess.max_ready_samples_per_lead * num_trainers
 
-                    assert isinstance(trainer_state.samples_processed, int)
-                    if published_samples - trainer_state.samples_processed > max_unconsumed_samples:
+                    min_samples_processed = min(
+                        ts.samples_processed for ts in trainer_states if isinstance(ts.samples_processed, int)
+                    )
+                    min_samples_processed_total = min_samples_processed * max(cfg.world.replicas, 1)
+                    if published_samples - min_samples_processed_total > max_unconsumed_samples:
                         # wait for the finetune loop to finish processing data
                         continue
 

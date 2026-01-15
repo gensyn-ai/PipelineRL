@@ -261,7 +261,8 @@ def rollout_maker_entrypoint(
     llms: list[TrainableLLM],
     scheduler_name: str,
 ):
-    trainer_state = TrainerState(Path(cfg.output_dir))
+    trainer_group = cfg.me.get("trainer_group", 0)
+    trainer_state = TrainerState(Path(cfg.output_dir), trainer_group=trainer_group)
     if cfg.debug.mode:
         trainer_state.propagated_weight_version = 0
     else:
@@ -334,8 +335,11 @@ class ActorLoop:
             assert llm_group
             llm_idxs = [llm[0] for llm in llm_group]
             llms = [llm[1] for llm in llm_group]
+            replica_idx = int(self.cfg.me.get("replica_idx", 0))
+            trainer_group = int(self.cfg.me.get("trainer_group", 0))
             scheduler_name = (
-                f"{'train' if is_training else 'test'} scheduler for llms {','.join([str(i) for i in llm_idxs])}"
+                f"{'train' if is_training else 'test'} scheduler actor_{replica_idx} group_{trainer_group} "
+                f"llms {','.join([str(i) for i in llm_idxs])}"
             )
             process = mp.Process(
                 target=rollout_maker_entrypoint,
@@ -588,18 +592,23 @@ def run_actor_loop(cfg: DictConfig):
     random.seed(cfg.seed)
 
     exp_path = Path(cfg.output_dir)
-    setup_logging(exp_path / "actor", "actor")
+    replica_idx = cfg.me.get("replica_idx", 0)
+    trainer_group = cfg.me.get("trainer_group", 0)
+    
+    setup_logging(exp_path / f"actor_{replica_idx}", f"actor_{replica_idx}")
     logger.info(f"Current dir: {os.getcwd()}, experiment root dir: {cfg.output_dir}")
     if cfg.wandb.use_wandb:
-        run = init_wandb(cfg, exp_path / "actor", flatten_dict_config(cfg))  # type: ignore
+        run = init_wandb(cfg, exp_path / f"actor_{replica_idx}", flatten_dict_config(cfg))  # type: ignore
         if run is None:
             raise ValueError("Failed to initialize wandb run")
+    
+    # cfg.me.llm_urls is already filtered by launch.py
     llm_urls = str(cfg.me.llm_urls).split("+")
 
     stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats")
-    test_stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats_test")
+    test_stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats_test", partition=int(trainer_group))
     data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor")
-    test_data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor_test")
+    test_data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor_test", partition=int(trainer_group))
 
     dataset_loader = hydra.utils.get_method(cfg.dataset_loader)
     # Get dataset loader parameters if they exist in config, otherwise use empty dict
@@ -612,7 +621,7 @@ def run_actor_loop(cfg: DictConfig):
     logger.info(f"Loaded {len(train_dataset)} training problems")
     logger.info(f"Loaded {len(test_dataset)} test problems")
 
-    finetune_model_path = exp_path / "finetune" / "current"
+    finetune_model_path = exp_path / f"finetune_{trainer_group}" / "current"
     if os.path.exists(finetune_model_path):
         actor_model_path = finetune_model_path
     else:
@@ -641,7 +650,7 @@ def run_actor_loop(cfg: DictConfig):
 
     wait_for_inference_servers(llm_urls)
     wait_for_environments(cfg)
-    trainer_state = TrainerState(exp_path)
+    trainer_state = TrainerState(exp_path, trainer_group=trainer_group)
     if cfg.debug.mode:
         trainer_state.debug_mode_init()
     else:

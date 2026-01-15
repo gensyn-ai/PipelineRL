@@ -26,6 +26,7 @@ class Job(BaseModel):
     gpus: list[int] = []
     # The URL of the job
     url: str = ""
+    trainer_group: int = 0
 
 
 class WorldMap:
@@ -74,17 +75,38 @@ class WorldMap:
         if cfg.environment:
             self._place_environments(cfg)
 
-        # Place the finetune workers on the remaining gpus, take all remaining GPUs
+        # Place the finetune workers on the remaining gpus, split by trainer group
+        # Collect all remaining GPUs first
+        all_remaining_gpus = []
+        for node, remaining_gpus in self.available_gpus.items():
+            for gpu in remaining_gpus:
+                all_remaining_gpus.append((node, gpu))
+        
+        assert len(all_remaining_gpus) == self.total_finetune_gpus
+        
+        # Split GPUs among trainer groups (replicas)
         current_finetune_rank = 0
         finetune_rank_node = {}
-        for node, remaining_gpus in self.available_gpus.items():
-            gpus = list(remaining_gpus)
-            if gpus:
-                self.add_job(node_rank=node, kind="finetune", replica_idx=node, gpus=gpus)
-                for _ in remaining_gpus:
-                    finetune_rank_node[current_finetune_rank] = node
-                    current_finetune_rank += 1
-
+        if cfg.world.replicas > 0 and self.finetune_gpus_per_replica > 0:
+            for group_idx in range(cfg.world.replicas):
+                start_idx = group_idx * self.finetune_gpus_per_replica
+                end_idx = start_idx + self.finetune_gpus_per_replica
+                group_gpus = all_remaining_gpus[start_idx:end_idx]
+                
+                # Group GPUs by node for this trainer group
+                gpus_by_node = {}
+                for node, gpu in group_gpus:
+                    if node not in gpus_by_node:
+                        gpus_by_node[node] = []
+                    gpus_by_node[node].append(gpu)
+                
+                # Create finetune job(s) for this trainer group
+                for node, gpus in gpus_by_node.items():
+                    self.add_job(node_rank=node, kind="finetune", replica_idx=group_idx, gpus=gpus, trainer_group=group_idx)
+                    for _ in gpus:
+                        finetune_rank_node[current_finetune_rank] = node
+                        current_finetune_rank += 1
+        
         assert current_finetune_rank == self.total_finetune_gpus
         if self.total_finetune_gpus % cfg.finetune.seq_parallel != 0:
             raise ValueError(
@@ -106,9 +128,11 @@ class WorldMap:
         for node, jobs in self.job_map.items():
             self._log_info(f"Node {node} has {len(jobs)} jobs:")
             for job in jobs:
-                self._log_info(f"  {job.kind} {job.replica_idx} on gpus {job.gpus}, local idx {job.local_idx}")
+                self._log_info(
+                    f"  {job.kind} {job.replica_idx} (trainer_group={job.trainer_group}) on gpus {job.gpus}, local idx {job.local_idx}"
+                )
 
-    def add_job(self, node_rank: int, kind: str, replica_idx: int, local_idx: int = 0, port: int | None = None, gpus: list[int] | None = None, cpu_heavy: bool = False, url: str = "") -> Job:
+    def add_job(self, node_rank: int, kind: str, replica_idx: int, local_idx: int = 0, port: int | None = None, gpus: list[int] | None = None, cpu_heavy: bool = False, url: str = "", trainer_group: int = 0) -> Job:
         """Add a job to the world map."""
         if gpus is None:
             gpus = []
@@ -121,7 +145,8 @@ class WorldMap:
             hostname=self.address_map[node_rank],
             port=port,
             gpus=gpus,
-            url=url
+            url=url,
+            trainer_group=trainer_group,
         )       
         self.job_map[node_rank].append(job)
         self.total_jobs += 1
@@ -178,14 +203,24 @@ class WorldMap:
             raise ValueError("Not enough gpus to place all workers")
         if self.total_finetune_gpus == 0:
             logger.warning("No GPUs left for finetune workers. You can still debug other parts of the pipeline.")
+        
+        # We need to split finetune GPUs among replicas
+        if cfg.world.replicas > 0:
+            self.finetune_gpus_per_replica = self.total_finetune_gpus // cfg.world.replicas
+            if self.finetune_gpus_per_replica == 0 and self.total_finetune_gpus > 0:
+                 logger.warning(f"Have {self.total_finetune_gpus} finetune GPUs but {cfg.world.replicas} replicas. Some replicas might get 0 GPUs.")
+        else:
+            self.finetune_gpus_per_replica = 0
 
-        self.weight_update_group_size = self.total_actor_llms * self.gpus_per_llm + 1
+        self.weight_update_group_size = self.llms_per_actor * self.gpus_per_llm + 1
 
     def _place_pipeline_stages(self, cfg):
         for worker_idx in range(cfg.world.replicas):
             node = self.get_least_busy_node()
-            self.add_job(kind="actor", replica_idx=worker_idx, node_rank=node, gpus=[], cpu_heavy=True)
-            self.add_job(kind="preprocessor", replica_idx=worker_idx, node_rank=node, gpus=[], cpu_heavy=True)
+            self.add_job(kind="actor", replica_idx=worker_idx, trainer_group=worker_idx, node_rank=node, gpus=[], cpu_heavy=True)
+        if cfg.world.replicas > 0:
+            node = self.get_least_busy_node()
+            self.add_job(kind="preprocessor", replica_idx=0, trainer_group=0, node_rank=node, gpus=[], cpu_heavy=True)
 
     def _place_environments(self, cfg):
         for worker_idx in range(cfg.world.env_replicas):
@@ -201,7 +236,7 @@ class WorldMap:
             )
 
     def _place_inference_jobs(self, cfg):
-        for _ in range(cfg.world.replicas):
+        for group_idx in range(cfg.world.replicas):
             for actor_llm_idx in range(self.llms_per_actor):
                 node = next(
                     (node for node in self.available_gpus if len(self.available_gpus[node]) >= self.gpus_per_llm), None
@@ -215,13 +250,14 @@ class WorldMap:
                     kind="actor_llm",
                     replica_idx=actor_llm_idx,
                     local_idx=local_idx,
+                    trainer_group=group_idx,
                     node_rank=node,
                     gpus=gpus,
                     port=8080 + local_idx,
                     url=llm_url,
                 )
 
-        for _ in range(cfg.world.replicas):
+        for group_idx in range(cfg.world.replicas):
             for preprocessor_llm_idx in range(self.llms_per_preprocessor):
                 node = next(
                     (node for node in self.available_gpus if len(self.available_gpus[node]) >= self.gpus_per_llm), None
@@ -235,6 +271,7 @@ class WorldMap:
                     kind="preprocessor_llm",
                     replica_idx=preprocessor_llm_idx,
                     local_idx=local_idx,
+                    trainer_group=group_idx,
                     node_rank=node,
                     gpus=gpus,
                     url=ref_url,
@@ -255,13 +292,36 @@ class WorldMap:
         return [node for node, jobs in self.job_map.items() if any(job.kind == "finetune" for job in jobs)]
 
     def my_finetuning_rank(self) -> int:
+        # This logic needs to change if we have multiple finetune groups
+        # But this function is likely used by DeepSpeed/Accelerate launcher to determine rank relative to the job
+        # If we launch separate jobs for each group, this logic should be relative to the group
+        # However, `nodes_with_finetuning` aggregates ALL finetune jobs.
+        # We need a way to filter by group.
+        # Let's add a group_idx arg, or rely on context.
+        # Since this method seems to be used inside `launch.py` to set up distributed env vars, 
+        # and we plan to launch separate processes per group, we should probably pass the group explicitly to `launch.py`'s `run_finetune`.
+        # `run_finetune` in `launch.py` calls `world_map.nodes_with_finetuning()`. 
+        # I'll keep this as is for now and add a new method or modify it later.
         return self.nodes_with_finetuning().index(self.my_rank)
+
+    def nodes_with_finetuning_for_group(self, group_idx: int) -> list[int]:
+        return [node for node, jobs in self.job_map.items() if any(job.kind == "finetune" and job.trainer_group == group_idx for job in jobs)]
+
+    def my_finetuning_rank_for_group(self, group_idx: int) -> int:
+        nodes = self.nodes_with_finetuning_for_group(group_idx)
+        if self.my_rank not in nodes:
+            return -1
+        return nodes.index(self.my_rank)
 
     def get_all_jobs(self):
         return [job for jobs in self.job_map.values() for job in jobs]
 
-    def get_actor_urls(self) -> list[str]:
-        return [job.url for job in self.get_all_jobs() if job.kind == "actor_llm"]
+    def get_actor_urls(self, group_idx: int | None = None) -> list[str]:
+        return [
+            job.url for job in self.get_all_jobs() 
+            if job.kind == "actor_llm" and (group_idx is None or job.trainer_group == group_idx)
+        ]
 
     def get_preprocessor_urls(self) -> list[str]:
         return [job.url for job in self.get_all_jobs() if job.kind == "preprocessor_llm"]
+

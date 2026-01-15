@@ -24,8 +24,13 @@ def setup_logging(cfg: DictConfig, output_dir: Path, run: wandb_run.Run | None =
     log_dir.mkdir(parents=True, exist_ok=True)
     debug_handler = logging.FileHandler(log_dir / f"info_{get_accelerator().process_index}.log")
     debug_handler.setLevel(logging.INFO)
+    trainer_group = 0
+    try:
+        trainer_group = int(cfg.me.get("trainer_group", 0))
+    except Exception:
+        trainer_group = 0
     logging.basicConfig(
-        format="[finetune]: %(asctime)s.%(msecs)03d - %(levelname)s - %(name)s - %(message)s",
+        format=f"[finetune_{trainer_group}]: %(asctime)s.%(msecs)03d - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
         handlers=[debug_handler, logging.StreamHandler()],

@@ -334,7 +334,8 @@ def run_finetuning_loop(
 
     # Rendez-vous with inference servers
     #TODO: rename the stream to be more general
-    weight_update_stream = SingleStreamSpec(exp_path=exp_root_dir, topic="weight_update_request")
+    trainer_group = cfg.me.get("trainer_group", 0)
+    weight_update_stream = SingleStreamSpec(exp_path=exp_root_dir, topic=f"{TRAINER_TOPIC}_{trainer_group}")
 
     # Logging
     if get_accelerator().is_main_process:
@@ -358,7 +359,7 @@ def run_finetuning_loop(
         exp_path=exp_root_dir,
         topic=args.input,
         instance=0,
-        partition=get_accelerator().process_index,
+        partition=int(cfg.me.get("trainer_group", 0)) * int(num_processes) + int(get_accelerator().process_index),
     )
 
     logger.info(f"Using {'packed' if args.seq_packing else 'unpacked'} collate function")
