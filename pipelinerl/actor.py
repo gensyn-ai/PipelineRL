@@ -606,9 +606,9 @@ def run_actor_loop(cfg: DictConfig):
     llm_urls = str(cfg.me.llm_urls).split("+")
 
     stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats")
-    test_stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats_test")
+    test_stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats_test", partition=int(trainer_group))
     data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor")
-    test_data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor_test")
+    test_data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor_test", partition=int(trainer_group))
 
     dataset_loader = hydra.utils.get_method(cfg.dataset_loader)
     # Get dataset loader parameters if they exist in config, otherwise use empty dict
