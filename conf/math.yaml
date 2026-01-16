@@ -33,3 +33,4 @@ test_dataset_names:
   - aime_2024
   - amc_2023
   - math_500
+  - gsm8k_test
