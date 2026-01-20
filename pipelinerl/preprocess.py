@@ -35,6 +35,7 @@ from pipelinerl.finetune.checkpoints import (
 )
 from pipelinerl.finetune.data import collate, collate_packed, preprocess_fn
 from pipelinerl.finetune.rl import RLConfig, populate_rl_data
+from pipelinerl.finetune.rl.mixing import get_mixing_strategy
 from pipelinerl.finetune.types import PipelineBatchEncoding
 from pipelinerl.finetune.utils import create_sentinel_batch
 from pipelinerl.llm import TrainableLLM
@@ -65,6 +66,181 @@ def _check_group_sizes(texts: list[dict], group_size: int) -> bool:
             return False
 
     return True
+
+
+def run_multi_stream_dataset_loader(
+    raw_chunk_queue: Queue,
+    data_streams: list[SingleStreamSpec],
+    primary_actor_id: int,
+    check_group_size: int,
+    chunk_n_groups: int,
+    pop_old_data: bool,
+    grpo_config: dict,
+):
+    """Load and mix rollouts from multiple actor streams for cross-actor GRPO."""
+    num_actors = len(data_streams)
+    enable_mixing = grpo_config.get('enable_cross_actor_mixing', False)
+    cross_actor_fraction = grpo_config.get('cross_actor_sample_fraction', 0.25)
+    timeout_seconds = grpo_config.get('cross_actor_timeout_seconds', 30)
+    mixing_strategy_name = grpo_config.get('mixing_strategy', 'random')
+    
+    logger.info(
+        f"Multi-stream loader: {num_actors} actors, primary={primary_actor_id}, "
+        f"mixing={'enabled' if enable_mixing else 'disabled'}, fraction={cross_actor_fraction}"
+    )
+    
+    if not enable_mixing:
+        # Fallback to single-stream behavior
+        logger.info("Cross-actor mixing disabled, using single stream")
+        return run_dataset_loader(
+            raw_chunk_queue=raw_chunk_queue,
+            data_stream=data_streams[primary_actor_id],
+            check_group_size=check_group_size,
+            chunk_n_groups=chunk_n_groups,
+            pop_old_data=pop_old_data,
+        )
+    
+    # Initialize mixing strategy
+    mixing_strategy = get_mixing_strategy(mixing_strategy_name)
+    n_other = int(check_group_size * cross_actor_fraction)
+    n_primary = check_group_size - n_other
+    
+    logger.info(f"Using {mixing_strategy_name} mixing: {n_primary} from primary, {n_other} from others")
+    
+    # Open readers for all streams
+    readers = [read_stream(stream).__enter__() for stream in data_streams]
+    
+    # Buffer rollouts by group_id from each actor
+    actor_buffers = {i: defaultdict(list) for i in range(num_actors)}
+    group_timestamps = {}  # Track when we first saw each group
+    completed_groups = set()
+    old_and_dropped = 0
+    last_time_notice = 0
+    
+    try:
+        while True:
+            current_time = time.time()
+            
+            # Read from all actor streams
+            for actor_id, reader in enumerate(readers):
+                try:
+                    for group in reader.read():
+                        for rollout in group:
+                            group_id = rollout["group_id"]
+                            
+                            # Skip if already completed
+                            if group_id in completed_groups:
+                                continue
+                            
+                            # Track first time we see this group
+                            if group_id not in group_timestamps:
+                                group_timestamps[group_id] = current_time
+                            
+                            actor_buffers[actor_id][group_id].append(rollout)
+                except StopIteration:
+                    break
+            
+            # Try to form complete groups
+            groups_to_process = list(group_timestamps.keys())
+            for group_id in groups_to_process:
+                if group_id in completed_groups:
+                    continue
+                
+                primary_rollouts = actor_buffers[primary_actor_id].get(group_id, [])
+                other_rollouts = []
+                for actor_id in range(num_actors):
+                    if actor_id != primary_actor_id:
+                        other_rollouts.extend(actor_buffers[actor_id].get(group_id, []))
+                
+                # Check if we have enough rollouts
+                has_enough = len(primary_rollouts) >= n_primary and len(other_rollouts) >= n_other
+                timed_out = (current_time - group_timestamps[group_id]) > timeout_seconds
+                
+                if has_enough:
+                    # Mix rollouts using strategy
+                    try:
+                        mixed_rollouts = mixing_strategy.select_rollouts(
+                            primary_rollouts, other_rollouts, n_primary, n_other
+                        )
+                        
+                        # Mark as completed and clean up buffers
+                        completed_groups.add(group_id)
+                        for actor_id in range(num_actors):
+                            if group_id in actor_buffers[actor_id]:
+                                del actor_buffers[actor_id][group_id]
+                        del group_timestamps[group_id]
+                        
+                        # Put mixed group in queue (as part of chunk)
+                        try:
+                            raw_chunk_queue.put_nowait(mixed_rollouts)
+                        except queue.Full:
+                            if pop_old_data:
+                                try:
+                                    raw_chunk_queue.get_nowait()
+                                    old_and_dropped += 1
+                                    if old_and_dropped // 100 != last_time_notice:
+                                        logger.info(f"Dropped {old_and_dropped} old elements")
+                                        last_time_notice = old_and_dropped // 100
+                                    raw_chunk_queue.put_nowait(mixed_rollouts)
+                                except Empty:
+                                    pass
+                            else:
+                                # Block until space available
+                                raw_chunk_queue.put(mixed_rollouts)
+                        
+                    except ValueError as e:
+                        logger.error(f"Failed to mix rollouts for group {group_id}: {e}")
+                        completed_groups.add(group_id)
+                        
+                elif timed_out:
+                    # Timeout: fallback to primary actor only
+                    if len(primary_rollouts) >= check_group_size:
+                        logger.warning(
+                            f"Timeout for group {group_id}, using {check_group_size} from primary actor"
+                        )
+                        fallback_rollouts = primary_rollouts[:check_group_size]
+                        # Reassign rollout_index
+                        for idx, rollout in enumerate(fallback_rollouts):
+                            rollout['metadata']['rollout_index'] = idx
+                        
+                        completed_groups.add(group_id)
+                        for actor_id in range(num_actors):
+                            if group_id in actor_buffers[actor_id]:
+                                del actor_buffers[actor_id][group_id]
+                        del group_timestamps[group_id]
+                        
+                        try:
+                            raw_chunk_queue.put_nowait(fallback_rollouts)
+                        except queue.Full:
+                            if pop_old_data:
+                                try:
+                                    raw_chunk_queue.get_nowait()
+                                    old_and_dropped += 1
+                                    raw_chunk_queue.put_nowait(fallback_rollouts)
+                                except Empty:
+                                    pass
+                            else:
+                                raw_chunk_queue.put(fallback_rollouts)
+                    else:
+                        logger.error(
+                            f"Timeout for group {group_id} with insufficient primary rollouts: "
+                            f"{len(primary_rollouts)} < {check_group_size}"
+                        )
+                        completed_groups.add(group_id)
+                        for actor_id in range(num_actors):
+                            if group_id in actor_buffers[actor_id]:
+                                del actor_buffers[actor_id][group_id]
+                        del group_timestamps[group_id]
+            
+            # Small sleep to avoid busy waiting
+            time.sleep(0.01)
+            
+    finally:
+        for reader in readers:
+            try:
+                reader.__exit__(None, None, None)
+            except Exception as e:
+                logger.error(f"Error closing reader: {e}")
 
 
 def batch_annotate_traces_with_ref_logprobs(llm: TrainableLLM, traces: List[dict]):
@@ -372,7 +548,29 @@ def run_preprocessing_loop(
     if llm_urls:
         wait_for_inference_servers(llm_urls)
 
-    input_stream = SingleStreamSpec(exp_path=exp_root_dir, topic=cfg.preprocess.input)
+    # Determine if we should use cross-actor mixing
+    num_trainer_groups = cfg.world.num_trainer_groups if cfg.world.num_trainer_groups > 1 else 1
+    use_cross_actor_mixing = (
+        cfg.finetune.get('grpo', {}).get('enable_cross_actor_mixing', False)
+        and num_trainer_groups > 1
+    )
+    
+    # For cross-actor mixing, we need to know which trainer group this preprocessor serves
+    # Currently there's only one preprocessor (trainer_group=0), so it serves all trainers
+    # In the future, this could be extended to have one preprocessor per trainer group
+    primary_actor_id = 0  # This preprocessor primarily serves trainer_group 0
+    
+    if use_cross_actor_mixing:
+        # Create streams for all actors
+        input_streams = [
+            SingleStreamSpec(exp_path=exp_root_dir, topic=f"actor_{i}")
+            for i in range(num_trainer_groups)
+        ]
+        logger.info(f"Using multi-stream loader with {num_trainer_groups} actor streams")
+    else:
+        # Use single stream (backward compatible)
+        input_streams = [SingleStreamSpec(exp_path=exp_root_dir, topic=cfg.preprocess.input)]
+        logger.info("Using single-stream loader")
     
     num_partitions = max(world_map.finetune_gpus_per_replica * max(cfg.world.replicas, 1), 1)
     output_stream = StreamRangeSpec(
@@ -386,14 +584,31 @@ def run_preprocessing_loop(
     raw_chunk_queue = Queue(cfg.preprocess.raw_queue_size)
     rl_config = RLConfig(**cfg.finetune.rl)
     pop_old_data = cfg.max_lag is None and cfg.pop_old_data and not cfg.debug.mode
-    dataset_loader_worker_fn = partial(
-        run_dataset_loader,
-        raw_chunk_queue=raw_chunk_queue,
-        data_stream=input_stream,
-        check_group_size=cfg.attempts,
-        chunk_n_groups=cfg.preprocess.chunk_n_groups,
-        pop_old_data=pop_old_data,
-    )
+    
+    if use_cross_actor_mixing:
+        # Use multi-stream loader with GRPO mixing
+        grpo_config = cfg.finetune.get('grpo', {})
+        dataset_loader_worker_fn = partial(
+            run_multi_stream_dataset_loader,
+            raw_chunk_queue=raw_chunk_queue,
+            data_streams=input_streams,
+            primary_actor_id=primary_actor_id,
+            check_group_size=cfg.attempts,
+            chunk_n_groups=cfg.preprocess.chunk_n_groups,
+            pop_old_data=pop_old_data,
+            grpo_config=grpo_config,
+        )
+    else:
+        # Use single-stream loader (backward compatible)
+        dataset_loader_worker_fn = partial(
+            run_dataset_loader,
+            raw_chunk_queue=raw_chunk_queue,
+            data_stream=input_streams[0],
+            check_group_size=cfg.attempts,
+            chunk_n_groups=cfg.preprocess.chunk_n_groups,
+            pop_old_data=pop_old_data,
+        )
+    
     # Start the dataset loader thread using Thread
     dataset_loader_thread = threading.Thread(target=dataset_loader_worker_fn, daemon=True)
     dataset_loader_thread.start()

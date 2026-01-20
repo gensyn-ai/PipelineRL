@@ -52,10 +52,10 @@ def init_wandb(
 
     wandb_name = str(run_dir)
     root = cfg.wandb.wandb_workspace_root
-    if root:
-        if not wandb_name.startswith(root + "/"):
-            raise ValueError(f"run_dir {run_dir} does not start with root {root}")
+    if root and wandb_name.startswith(root + "/"):
         wandb_name = wandb_name[len(root) + 1 :]
+    
+    # If not under root, we just keep wandb_name as the full path (or whatever run_dir was)
 
     wandb_id = cfg.wandb.wandb_id
     if not wandb_id:

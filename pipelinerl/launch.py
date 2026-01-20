@@ -85,8 +85,32 @@ def validate_config(cfg: DictConfig):
             f"vllm_kwargs.max_model_len {cfg.vllm_config.vllm_kwargs.max_model_len}"
         )
 
-    # Check for asymmetric PPO clipping
-    if cfg.finetune.rl.policy_loss == "ppo" and cfg.finetune.rl.epsilon_low != cfg.finetune.rl.epsilon_high:
+    # Validate GRPO cross-actor mixing configuration
+    grpo_config = cfg.finetune.get('grpo', {})
+    if grpo_config.get('enable_cross_actor_mixing', False):
+        if cfg.world.num_trainer_groups <= 1:
+            logger.warning(
+                "GRPO cross_actor_mixing is enabled but num_trainer_groups <= 1. "
+                "Cross-actor mixing requires multiple trainer groups. Disabling mixing."
+            )
+            cfg.finetune.grpo.enable_cross_actor_mixing = False
+        else:
+            fraction = grpo_config.get('cross_actor_sample_fraction', 0.25)
+            if not (0.0 <= fraction <= 1.0):
+                raise ValueError(
+                    f"cross_actor_sample_fraction must be in [0.0, 1.0], got {fraction}"
+                )
+            timeout = grpo_config.get('cross_actor_timeout_seconds', 30)
+            if timeout <= 0:
+                raise ValueError(
+                    f"cross_actor_timeout_seconds must be positive, got {timeout}"
+                )
+            logger.info(
+                f"GRPO cross-actor mixing enabled: fraction={fraction}, "
+                f"timeout={timeout}s, num_actors={cfg.world.num_trainer_groups}"
+            )
+
+    if cfg.finetune.rl.get("asymmetric_clipping", False):
         if cfg.finetune.model_class == "causal-language-modeling-with-value-head":
             logger.warning(
                 "Asymmetric clipping with value head has not been tested and it may lead to unexpected behavior. "
@@ -94,7 +118,8 @@ def validate_config(cfg: DictConfig):
             )
         else:
             logger.warning(
-                "Using asymmetric clipping. Note: this was recommended in DAPO (https://arxiv.org/abs/2503.14476) for GRPO."
+                "Asymmetric clipping is recommended for GRPO (PPO without value head and group_size > 1). "
+                "See DAPO paper: https://arxiv.org/abs/2503.14476"
             )
 
 
@@ -633,10 +658,11 @@ def main(cfg: DictConfig):
 
     group = str(exp_dir)
     root = cfg.wandb.wandb_workspace_root
-    if root:
-        if not group.startswith(root + "/"):
-            raise ValueError(f"run_dir {exp_dir} does not start with root {root}")
+    if root and group.startswith(root + "/"):
         cfg.wandb.wandb_group = group[len(root) + 1 :]
+    else:
+        # Fallback for arbitrary paths: use the directory name or full path
+        cfg.wandb.wandb_group = str(exp_dir).strip("/").replace("/", "_")
     if world_map.total_finetune_gpus:
         accum_passes = cfg.finetune.gradient_accumulation_passes
         n_gpus = world_map.total_finetune_gpus

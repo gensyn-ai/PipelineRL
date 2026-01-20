@@ -1,16 +1,20 @@
 import asyncio
+import hashlib
+import json
 import logging
 import math
 import multiprocessing as mp
 import os
-import queue
 import random
 import time
 from collections import defaultdict
+from functools import partial
+from multiprocessing import Queue
 from multiprocessing.managers import SharedMemoryManager
 from pathlib import Path
 from queue import Empty
 from typing import Dict, List
+from uuid import UUID, uuid4
 
 import aiohttp
 import hydra
@@ -163,7 +167,7 @@ async def schedule_rollouts(
 
     async def rollout_and_maybe_produce_result(
         problem: dict,
-        group_id: int,
+        group_id: str,
         rollout_index: int,
         llm_index: int,
         session: aiohttp.ClientSession,
@@ -175,15 +179,15 @@ async def schedule_rollouts(
             assert model_version is not None
             rollout_result = await rollout_policy(cfg, llm, problem, session)
             rollout_result.model_version = model_version
-            # Make a group id that will be different from groups made by another rollout maker
-            full_group_id = f"{scheduler_name}_{group_id}"
-            rollout_result.group_id = full_group_id
+            # Use problem UUID for group_id to ensure consistency across actors
+            rollout_result.group_id = group_id
             for step_index, sample in enumerate(rollout_result.training_texts):
                 # Downstream in the pipeline we'll need these fields in every sample
                 sample.metadata["model_version"] = model_version
                 sample.metadata["rollout_index"] = rollout_index
                 sample.metadata["step_index"] = step_index
-                sample.group_id = full_group_id
+                sample.metadata["actor_id"] = trainer_state.trainer_group
+                sample.group_id = group_id
             group_rollouts[group_id].append(rollout_result)
             if len(group_rollouts[group_id]) == attempts:
                 # This is blocking call, but there's just one other thread reading from this queue.
@@ -196,9 +200,10 @@ async def schedule_rollouts(
         finally:
             active_rollouts[llm_index] -= 1
 
-    group_id = -1
+    group_id = None
     group_rollout_index = attempts
     problem = None
+    groups_started = 0
 
     last_logged = time.time()
     logger.info("Starting rollout scheduler")
@@ -216,7 +221,7 @@ async def schedule_rollouts(
                     f"groups in progress: {len(group_rollouts)}, "
                     f"rollouts started so far: {started_rollouts}, "
                     f"rollouts finished so far: {finished_rollouts}, "
-                    f"groups started so far: {group_id}, "
+                    f"groups started so far: {groups_started}, "
                     f"max group size in bytes: {result_queue.max_actual_entry_size()}, "
                 )
                 last_logged = time.time()
@@ -228,9 +233,13 @@ async def schedule_rollouts(
                     # give some quality time for other couroutines to work
                     await asyncio.sleep(0.01)
                     continue
-                group_id += 1
+                # Generate UUID-based group_id for cross-actor consistency
+                problem_uuid = get_problem_uuid(problem)
+                model_version = trainer_state.propagated_weight_version
+                group_id = f"problem_{problem_uuid}_v{model_version}"
                 group_rollouts[group_id] = []
                 group_rollout_index = 0
+                groups_started += 1
 
             next_llm = active_rollouts.index(min(active_rollouts))
             if active_rollouts[next_llm] == cfg.actor.llm_max_rollouts:
@@ -283,8 +292,15 @@ def random_iter(problems: list):
 
 
 def sequential_iter(problems: list):
-    for problem in problems:
-        yield problem
+    while True:
+        for problem in problems:
+            yield problem
+
+
+def get_problem_uuid(problem: dict) -> str:
+    """Generate a deterministic UUID for a problem based on its content."""
+    problem_str = json.dumps(problem, sort_keys=True)
+    return hashlib.sha256(problem_str.encode()).hexdigest()[:16]
 
 
 class ActorLoop:
@@ -406,10 +422,19 @@ class ActorLoop:
         trainer_version_to_publish = None
 
         # If training, we expect to sample infinitely
-        # for train sample, sample random batches infinitely
+        # for train sample, sample random batches infinitely (unless using cross-actor mixing)
         # for test samples, loop through the dataset once
+        use_cross_actor_mixing = (
+            self.cfg.finetune.get('grpo', {}).get('enable_cross_actor_mixing', False)
+            and self.cfg.world.num_trainer_groups > 1
+        )
         if self.is_training:
-            problem_iter = random_iter(dataset)
+            if use_cross_actor_mixing:
+                # Use sequential iteration for cross-actor GRPO to ensure same prompts
+                logger.info("Using sequential iteration for cross-actor GRPO mixing")
+                problem_iter = sequential_iter(dataset)
+            else:
+                problem_iter = random_iter(dataset)
         else:
             problem_iter = sequential_iter(dataset)
         assert self.trainer_state.propagated_weight_version is not None
@@ -607,7 +632,8 @@ def run_actor_loop(cfg: DictConfig):
 
     stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats")
     test_stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats_test", partition=int(trainer_group))
-    data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor")
+    # Use actor-specific stream for cross-actor GRPO mixing
+    data_stream = SingleStreamSpec(exp_path=exp_path, topic=f"actor_{trainer_group}")
     test_data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor_test", partition=int(trainer_group))
 
     dataset_loader = hydra.utils.get_method(cfg.dataset_loader)

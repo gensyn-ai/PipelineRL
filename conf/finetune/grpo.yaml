@@ -5,3 +5,10 @@ defaults:
 attempts: 8
 rl:
   policy_loss: ppo
+
+# Cross-actor rollout mixing for GRPO (requires num_trainer_groups > 1)
+grpo:
+  enable_cross_actor_mixing: false  # Enable cross-actor rollout mixing
+  cross_actor_sample_fraction: 0.25  # Fraction of rollouts from other actors (0.0-1.0)
+  cross_actor_timeout_seconds: 30  # Max wait time for rollouts from other actors
+  mixing_strategy: "random"  # Mixing strategy: "random" (extensible for future strategies)
