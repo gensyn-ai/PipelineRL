@@ -92,6 +92,9 @@ eval_every_n_versions: 78000
 
 # changed
 model_path: Qwen/Qwen2.5-7B
+# Optional: per-replica model paths (overrides model_path for each replica)
+# Example: model_paths: [Qwen/Qwen2.5-1.5B, Qwen/Qwen2.5-8B]
+model_paths: null
 
 # will use default based on the chosen backend
 accelerate_config: null

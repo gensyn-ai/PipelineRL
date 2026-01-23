@@ -51,6 +51,14 @@ def _popen(
 
 
 def validate_config(cfg: DictConfig):
+    # Validate model_paths if specified
+    if cfg.model_paths:
+        if len(cfg.model_paths) != cfg.world.replicas:
+            raise ValueError(
+                f"model_paths length ({len(cfg.model_paths)}) must match "
+                f"world.replicas ({cfg.world.replicas})"
+            )
+    
     if cfg.world.preprocessor_fraction == 0 and cfg.finetune.rl.kl_coef > 0.0:
         raise ValueError("Preprocessor fraction must be > 0 if KL is used")
     
@@ -148,7 +156,7 @@ def _get_quantization_env(cfg: DictConfig) -> dict[str, str]:
     return env
 
 
-def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
+def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path, trainer_group: int = 0):
     kwargs = cfg.vllm_config.vllm_kwargs
     if kwargs["num-scheduler-steps"] > 1:
         kwargs["num-scheduler-steps"] = 1
@@ -156,12 +164,18 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
     log_dir = exp_dir / f"ref_vllm_{preprocessor_llm_idx}"
     os.makedirs(log_dir, exist_ok=True)
 
+    # Get model path for this trainer group
+    if cfg.model_paths and trainer_group < len(cfg.model_paths):
+        model_path = cfg.model_paths[trainer_group]
+    else:
+        model_path = cfg.model_path
+
     cmd = [
         "python",
         "-m",
         "vllm.entrypoints.openai.api_server",
         "--model",
-        str(cfg.model_path),
+        str(model_path),
         "--port",
         str(8180 + local_idx),
         "--host",
@@ -203,12 +217,18 @@ def run_actor_llm(
     trainer_group = job.trainer_group
     os.makedirs(exp_dir / "stores", exist_ok=True)
     
+    # Get model path for this trainer group
+    if cfg.model_paths and trainer_group < len(cfg.model_paths):
+        base_model_path = cfg.model_paths[trainer_group]
+    else:
+        base_model_path = cfg.model_path
+    
     # Each trainer group has its own finetune output directory
     finetune_model_path = exp_dir / f"finetune_{trainer_group}" / "current"
     if os.path.exists(finetune_model_path):
         actor_model_path = finetune_model_path
     else:
-        actor_model_path = cfg.model_path
+        actor_model_path = base_model_path
 
     # TODO: add support for tensor and process parallelism
     log_dir = exp_dir / f"actor_vllm_{trainer_group}_{actor_llm_idx}"
@@ -622,7 +642,7 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
         elif job.kind == "preprocessor_llm":
             if cfg.debug.use_existing_llms:
                 continue            
-            processes.extend(run_ref_llm(cfg, job.replica_idx, job.local_idx, job.gpus, exp_dir))
+            processes.extend(run_ref_llm(cfg, job.replica_idx, job.local_idx, job.gpus, exp_dir, job.trainer_group))
         elif job.kind == "finetune":
             processes.extend(run_finetune(cfg, world_map, job, exp_dir))
         else:

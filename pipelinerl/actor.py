@@ -647,11 +647,17 @@ def run_actor_loop(cfg: DictConfig):
     logger.info(f"Loaded {len(train_dataset)} training problems")
     logger.info(f"Loaded {len(test_dataset)} test problems")
 
+    # Get model path for this trainer group
+    if cfg.model_paths and trainer_group < len(cfg.model_paths):
+        base_model_path = cfg.model_paths[trainer_group]
+    else:
+        base_model_path = cfg.model_path
+
     finetune_model_path = exp_path / f"finetune_{trainer_group}" / "current"
     if os.path.exists(finetune_model_path):
         actor_model_path = finetune_model_path
     else:
-        actor_model_path = cfg.model_path
+        actor_model_path = base_model_path
     
     train_llms = [
         TrainableLLM(
